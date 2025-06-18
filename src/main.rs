@@ -85,21 +85,21 @@ impl AsyncScalarUDFImpl for SqlUdf {
 
         if output_batches.len() != 1 {
             return Err(DataFusionError::Execution(format!(
-                "SQL function Error: expected 1 output batch, got {}",
+                "SQL UDF Error: expected 1 output batch, got {}",
                 output_batches.len()
             )));
         }
         let first_batch = output_batches.first().unwrap();
         if first_batch.num_columns() != 1 {
             return Err(DataFusionError::Execution(format!(
-                "SQL function Error: expected 1 output column, got {}",
+                "SQL UDF Error: expected 1 output column, got {}",
                 first_batch.num_columns()
             )));
         }
         let array = first_batch.column(0).clone();
         if array.len() != output_length {
             return Err(DataFusionError::Execution(format!(
-                "SQL function Error: output length mismatch, expected {} but got {}",
+                "SQL UDF Error: output length mismatch, expected {} but got {}",
                 output_length,
                 array.len()
             )));
@@ -153,12 +153,35 @@ async fn main() -> Result<()> {
     ctx.register_csv("example", "data.csv", CsvReadOptions::default())
         .await?;
 
+    //////////////////////////////////////////////
+    // with direct sql
+    //////////////////////////////////////////////
+    // warmup
+    let df = ctx.sql("SELECT a, a + 1 FROM example").await?;
+    df.count().await.unwrap();
+
+    // run
     let start = Instant::now();
     let df = ctx.sql("SELECT a, a + 1 FROM example").await?;
+    let elapsed_direct = start.elapsed();
 
-    let elapsed = start.elapsed();
     // df.show().await?;
     dbg!(df.count().await.unwrap());
-    println!("Elapsed time: {:?}", elapsed);
+    println!("Elapsed time (direct): {:?}", elapsed_direct);
+
+    //////////////////////////////////////////////
+    // with SQL UDF
+    //////////////////////////////////////////////
+    // warmup
+    let df = ctx.sql("SELECT a, add_one(a) FROM example").await?;
+    df.count().await.unwrap();
+
+    let start = Instant::now();
+    let df = ctx.sql("SELECT a, add_one(a) FROM example").await?;
+    let elapsed_sql_udf = start.elapsed();
+
+    // df.show().await?;
+    dbg!(df.count().await.unwrap());
+    println!("Elapsed time (SQL UDF): {:?}", elapsed_sql_udf);
     Ok(())
 }
