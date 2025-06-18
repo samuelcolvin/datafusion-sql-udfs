@@ -22,6 +22,7 @@ use datafusion::{
     },
     prelude::*,
     scalar::ScalarValue,
+    sql::parser::Statement,
 };
 use regex::RegexBuilder;
 
@@ -30,8 +31,7 @@ pub struct SqlUdf {
     signature: Signature,
     name: String,
     schema: Arc<Schema>,
-    // TODO we could parse the sql and store the Statement to save a little time
-    sql: String,
+    body: Statement,
     return_type: DataType,
 }
 
@@ -54,7 +54,7 @@ impl Display for SqlUdf {
 }
 
 impl SqlUdf {
-    fn new(name: String, parameters: Vec<Field>, sql: String, return_type: DataType) -> Self {
+    fn new(name: String, parameters: Vec<Field>, body: Statement, return_type: DataType) -> Self {
         Self {
             signature: Signature::exact(
                 parameters
@@ -65,7 +65,7 @@ impl SqlUdf {
             ),
             name,
             schema: Arc::new(Schema::new(parameters)),
-            sql,
+            body,
             return_type,
         }
     }
@@ -117,7 +117,10 @@ impl AsyncScalarUDFImpl for SqlUdf {
         let args_batch = RecordBatch::try_new(self.schema.clone(), arg_arrays)?;
         ctx.register_batch("arguments", args_batch)?;
 
-        let output_batches = ctx.sql(&self.sql).await?.collect().await?;
+        // let output_batches = ctx.sql(&self.sql).await?.collect().await?;
+        let plan = ctx.state().statement_to_plan(self.body.clone()).await?;
+        SQLOptions::new().verify_plan(&plan)?;
+        let output_batches = ctx.execute_logical_plan(plan).await?.collect().await?;
 
         if output_batches.len() != 1 {
             return Err(DataFusionError::Execution(format!(
@@ -181,12 +184,17 @@ impl FunctionFactory for CollectSqlUdfs {
             ));
         };
 
+        let config = SessionConfig::new();
+        let dialect = config.options().sql_parser.dialect.clone();
+        let ctx = SessionContext::new_with_config(config);
+        let body = ctx.state().sql_to_statement(&sql, &dialect)?;
+
         let sql_udf = SqlUdf::new(
             statement.name,
             args.into_iter()
                 .map(|a| Field::new(a.name.unwrap().to_string(), a.data_type.clone(), true))
                 .collect(),
-            sql,
+            body,
             statement.return_type.unwrap(),
         );
         self.udfs.lock().unwrap().push(sql_udf);
@@ -198,7 +206,7 @@ impl FunctionFactory for CollectSqlUdfs {
 pub async fn parse_functions(sql: &str) -> Result<Vec<SqlUdf>> {
     let factory = Arc::new(CollectSqlUdfs::default());
     let ctx = SessionContext::new().with_function_factory(factory.clone());
-    let re = RegexBuilder::new(r"^\s*CREATE\s+FUNCTION.+?LANGUAGE SQL;$")
+    let re = RegexBuilder::new(r"^\s*CREATE\s+FUNCTION.+?LANGUAGE\s+SQL\s*;\s*$")
         .case_insensitive(true)
         .multi_line(true)
         .dot_matches_new_line(true)

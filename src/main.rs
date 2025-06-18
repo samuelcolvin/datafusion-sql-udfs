@@ -31,32 +31,47 @@ async fn main() -> Result<()> {
     //////////////////////////////////////////////
     // with direct sql
     //////////////////////////////////////////////
+
     // warmup
-    let df = ctx.sql("SELECT a, a + 1 FROM example").await?;
-    df.count().await.unwrap();
+    ctx.sql("SELECT a, a + 1 FROM example")
+        .await?
+        .collect()
+        .await?;
 
     // run
     let start = Instant::now();
-    let df = ctx.sql("SELECT a, a + 1 FROM example").await?;
+    let batch1 = ctx
+        .sql("SELECT a, a + 1 FROM example")
+        .await?
+        .collect()
+        .await?;
     let elapsed_direct = start.elapsed();
 
     // df.show().await?;
-    dbg!(df.count().await.unwrap());
-    println!("Elapsed time (direct): {:?}", elapsed_direct);
+    // dbg!(df.count().await.unwrap());
 
     //////////////////////////////////////////////
     // with SQL UDF
     //////////////////////////////////////////////
-    // warmup
-    let df = ctx.sql("SELECT a, add_one(a) FROM example").await?;
-    df.count().await.unwrap();
 
+    // warmup
+    ctx.sql("SELECT a, add_one(a) FROM example")
+        .await?
+        .collect()
+        .await?;
+
+    // run
     let start = Instant::now();
-    let df = ctx.sql("SELECT a, add_one(a) FROM example").await?;
+    let batch2 = ctx
+        .sql("SELECT a, add_one(a) FROM example")
+        .await?
+        .collect()
+        .await?;
     let elapsed_sql_udf = start.elapsed();
 
     // df.show().await?;
-    dbg!(df.count().await.unwrap());
+    // dbg!(df.count().await.unwrap());
+    println!("Elapsed time (direct): {:?}", elapsed_direct);
     println!("Elapsed time (SQL UDF): {:?}", elapsed_sql_udf);
 
     let df = ctx.sql("SELECT llm_cost('gpt-4o', 1, 1)").await?;
