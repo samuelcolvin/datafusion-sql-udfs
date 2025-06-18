@@ -1,5 +1,6 @@
 use std::{
     any::Any,
+    fmt::Display,
     sync::{Arc, Mutex},
 };
 
@@ -16,20 +17,40 @@ use datafusion::{
         context::{FunctionFactory, RegisterFunction},
     },
     logical_expr::{
-        ColumnarValue, CreateFunction, Signature, Volatility,
+        ColumnarValue, CreateFunction, ScalarUDF, Signature, Volatility,
         async_udf::{AsyncScalarFunctionArgs, AsyncScalarUDFImpl},
     },
     prelude::*,
     scalar::ScalarValue,
 };
+use regex::RegexBuilder;
 
 #[derive(Debug, Clone)]
 pub struct SqlUdf {
     signature: Signature,
     name: String,
-    parameters: Vec<Field>,
+    schema: Arc<Schema>,
+    // TODO we could parse the sql and store the Statement to save a little time
     sql: String,
     return_type: DataType,
+}
+
+impl Display for SqlUdf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let args = self
+            .schema
+            .fields()
+            .iter()
+            .map(|field| format!("{} {}", field.name(), field.data_type()))
+            .collect::<Vec<_>>();
+        write!(
+            f,
+            "{}({}) -> {}",
+            self.name,
+            args.join(", "),
+            self.return_type
+        )
+    }
 }
 
 impl SqlUdf {
@@ -43,7 +64,7 @@ impl SqlUdf {
                 Volatility::Immutable,
             ),
             name,
-            parameters,
+            schema: Arc::new(Schema::new(parameters)),
             sql,
             return_type,
         }
@@ -77,11 +98,6 @@ impl AsyncScalarUDFImpl for SqlUdf {
         args: AsyncScalarFunctionArgs,
         options: &ConfigOptions,
     ) -> Result<ArrayRef> {
-        let args = ColumnarValue::values_to_arrays(&args.args)?;
-        let output_length = args[0].len();
-
-        let args_batch = RecordBatch::try_new(Schema::new(self.parameters.clone()).into(), args)?;
-
         let mut config = SessionConfig::new();
 
         // TODO is there a nicer way to copy options to the udf config? should we copy all these options?
@@ -96,7 +112,11 @@ impl AsyncScalarUDFImpl for SqlUdf {
 
         let ctx = SessionContext::new_with_config(config);
 
+        let arg_arrays = ColumnarValue::values_to_arrays(&args.args)?;
+        let output_length = arg_arrays[0].len();
+        let args_batch = RecordBatch::try_new(self.schema.clone(), arg_arrays)?;
         ctx.register_batch("arguments", args_batch)?;
+
         let output_batches = ctx.sql(&self.sql).await?.collect().await?;
 
         if output_batches.len() != 1 {
@@ -127,12 +147,21 @@ impl AsyncScalarUDFImpl for SqlUdf {
 #[derive(Debug, Clone)]
 struct CollectSqlUdfs {
     udfs: Arc<Mutex<Vec<SqlUdf>>>,
+    // this function isn't used, we just need something to return from `create`
+    dummy_udf: Arc<ScalarUDF>,
 }
 
 impl Default for CollectSqlUdfs {
     fn default() -> Self {
         Self {
             udfs: Arc::new(Mutex::new(Vec::new())),
+            dummy_udf: Arc::new(create_udf(
+                "dummy",
+                vec![],
+                DataType::Null,
+                Volatility::Immutable,
+                Arc::new(|_: &[ColumnarValue]| Ok(ColumnarValue::Scalar(ScalarValue::Null))),
+            )),
         }
     }
 }
@@ -146,10 +175,9 @@ impl FunctionFactory for CollectSqlUdfs {
     ) -> Result<RegisterFunction> {
         let args = statement.args.unwrap();
         let body_expr = statement.params.function_body.unwrap();
-        dbg!(&body_expr);
         let Expr::Literal(ScalarValue::Utf8(Some(sql))) = body_expr else {
-            return Err(DataFusionError::Internal(
-                "Expected a string literal".to_string(),
+            return Err(DataFusionError::Plan(
+                "Expected a string literal for the function body".to_string(),
             ));
         };
 
@@ -163,22 +191,22 @@ impl FunctionFactory for CollectSqlUdfs {
         );
         self.udfs.lock().unwrap().push(sql_udf);
 
-        // this function isn't used, we just need something to return
-        let dummy_udf = create_udf(
-            "dummy",
-            vec![],
-            DataType::Null,
-            Volatility::Immutable,
-            Arc::new(|_: &[ColumnarValue]| Ok(ColumnarValue::Scalar(ScalarValue::Null))),
-        );
-        Ok(RegisterFunction::Scalar(Arc::new(dummy_udf)))
+        Ok(RegisterFunction::Scalar(self.dummy_udf.clone()))
     }
 }
 
 pub async fn parse_functions(sql: &str) -> Result<Vec<SqlUdf>> {
     let factory = Arc::new(CollectSqlUdfs::default());
     let ctx = SessionContext::new().with_function_factory(factory.clone());
-    for chunk in sql.split("\n\n") {
+    let re = RegexBuilder::new(r"^\s*CREATE\s+FUNCTION.+?LANGUAGE SQL;$")
+        .case_insensitive(true)
+        .multi_line(true)
+        .dot_matches_new_line(true)
+        .build()
+        .unwrap();
+
+    for capture in re.captures_iter(sql) {
+        let chunk = capture.get(0).unwrap().as_str();
         ctx.sql(chunk).await?;
     }
     Ok(factory.udfs.lock().unwrap().clone())

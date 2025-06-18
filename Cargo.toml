@@ -9,6 +9,7 @@ async-trait = "0.1.88"
 # datafusion = "48.0.0"
 # last commit from https://github.com/apache/datafusion/pull/14837
 datafusion = { git = "https://github.com/apache/datafusion", rev = "2462dd0f9439c9c7d7104e8e168d2b64b597c473" }
+regex = "1.11.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.45.1", features = ["full"] }

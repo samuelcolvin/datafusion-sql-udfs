@@ -2452,6 +2452,7 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "datafusion",
+ "regex",
  "serde",
  "serde_json",
  "tokio",
