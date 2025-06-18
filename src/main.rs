@@ -1,162 +1,17 @@
-use std::{any::Any, sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant};
 
-use async_trait::async_trait;
-use datafusion::{
-    arrow::{
-        array::{ArrayRef, RecordBatch},
-        datatypes::{DataType, Field, Schema},
-    },
-    config::ConfigOptions,
-    error::{DataFusionError, Result},
-    logical_expr::{
-        ColumnarValue, Signature, Volatility,
-        async_udf::{AsyncScalarFunctionArgs, AsyncScalarUDF, AsyncScalarUDFImpl},
-    },
-    prelude::*,
-};
-use serde::{Deserialize, Serialize};
+use datafusion::{error::Result, logical_expr::async_udf::AsyncScalarUDF, prelude::*};
 
-#[derive(Debug, Clone)]
-struct SqlUdf {
-    signature: Signature,
-    name: String,
-    parameters: Vec<Field>,
-    sql: String,
-    return_type: DataType,
-}
-
-impl SqlUdf {
-    fn new(name: &str, sql: &str, parameters: Vec<Field>, return_type: DataType) -> Self {
-        Self {
-            signature: Signature::exact(
-                parameters
-                    .iter()
-                    .map(|field| field.data_type().clone())
-                    .collect(),
-                Volatility::Immutable,
-            ),
-            name: name.to_string(),
-            parameters,
-            sql: sql.to_string(),
-            return_type,
-        }
-    }
-}
-
-#[async_trait]
-impl AsyncScalarUDFImpl for SqlUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        Ok(self.return_type.clone())
-    }
-
-    fn ideal_batch_size(&self) -> Option<usize> {
-        Some(8000)
-    }
-
-    async fn invoke_async_with_args(
-        &self,
-        args: AsyncScalarFunctionArgs,
-        options: &ConfigOptions,
-    ) -> Result<ArrayRef> {
-        dbg!(&self.name);
-        let args = ColumnarValue::values_to_arrays(&args.args)?;
-        let output_length = args[0].len();
-
-        let args_batch = RecordBatch::try_new(Schema::new(self.parameters.clone()).into(), args)?;
-
-        let mut config = SessionConfig::new();
-
-        // TODO is there a nicer way to copy options to the udf config? should we copy all these options?
-        let config_options = config.options_mut();
-        config_options.catalog = options.catalog.clone();
-        config_options.execution = options.execution.clone();
-        config_options.optimizer = options.optimizer.clone();
-        config_options.sql_parser = options.sql_parser.clone();
-        config_options.explain = options.explain.clone();
-        config_options.extensions = options.extensions.clone();
-        config_options.format = options.format.clone();
-
-        let ctx = SessionContext::new_with_config(config);
-
-        ctx.register_batch("arguments", args_batch)?;
-
-        let output_batches = ctx.sql(&self.sql).await?.collect().await?;
-
-        if output_batches.len() != 1 {
-            return Err(DataFusionError::Execution(format!(
-                "SQL UDF Error: expected 1 output batch, got {}",
-                output_batches.len()
-            )));
-        }
-        let first_batch = output_batches.first().unwrap();
-        if first_batch.num_columns() != 1 {
-            return Err(DataFusionError::Execution(format!(
-                "SQL UDF Error: expected 1 output column, got {}",
-                first_batch.num_columns()
-            )));
-        }
-        let array = first_batch.column(0).clone();
-        if array.len() != output_length {
-            return Err(DataFusionError::Execution(format!(
-                "SQL UDF Error: output length mismatch, expected {} but got {}",
-                output_length,
-                array.len()
-            )));
-        }
-        Ok(array)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FieldDefinition {
-    name: String,
-    data_type: DataType,
-}
-
-impl From<FieldDefinition> for Field {
-    fn from(field_def: FieldDefinition) -> Self {
-        Field::new(&field_def.name, field_def.data_type, true)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SqlUdfDefinition {
-    name: String,
-    sql: String,
-    parameters: Vec<FieldDefinition>,
-    return_type: DataType,
-}
+mod sql_udf;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let ctx = SessionContext::new();
 
-    let content = std::fs::read_to_string("udfs.json").unwrap();
-    let udf_definitions: Vec<SqlUdfDefinition> = serde_json::from_str(&content).unwrap();
+    let content = std::fs::read_to_string("udfs.sql").unwrap();
+    let udfs = sql_udf::parse_functions(&content).await?;
 
-    // Register SQL UDFs
-    for udf_def in udf_definitions {
-        let fields = udf_def.parameters;
-        let return_type = udf_def.return_type;
-
-        let sql_udf = SqlUdf::new(
-            &udf_def.name,
-            &udf_def.sql,
-            fields.into_iter().map(Into::into).collect(),
-            return_type,
-        );
+    for sql_udf in udfs {
         let async_udf = AsyncScalarUDF::new(Arc::new(sql_udf));
         ctx.register_udf(async_udf.into_scalar_udf());
     }
@@ -191,8 +46,8 @@ async fn main() -> Result<()> {
     let df = ctx.sql("SELECT a, add_one(a) FROM example").await?;
     let elapsed_sql_udf = start.elapsed();
 
-    // df.show().await?;
-    dbg!(df.count().await.unwrap());
+    df.show().await?;
+    // dbg!(df.count().await.unwrap());
     println!("Elapsed time (SQL UDF): {:?}", elapsed_sql_udf);
     Ok(())
 }
