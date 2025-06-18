@@ -68,7 +68,7 @@ impl AsyncScalarUDFImpl for SqlUdf {
     async fn invoke_async_with_args(
         &self,
         args: AsyncScalarFunctionArgs,
-        _option: &ConfigOptions,
+        options: &ConfigOptions,
     ) -> Result<ArrayRef> {
         dbg!(&self.name);
         let args = ColumnarValue::values_to_arrays(&args.args)?;
@@ -76,7 +76,18 @@ impl AsyncScalarUDFImpl for SqlUdf {
 
         let args_batch = RecordBatch::try_new(Schema::new(self.parameters.clone()).into(), args)?;
 
-        let config = SessionConfig::new().set_str("datafusion.sql_parser.dialect", "postgres");
+        let mut config = SessionConfig::new();
+
+        // TODO is there a nicer way to copy options to the udf config? should we copy all these options?
+        let config_options = config.options_mut();
+        config_options.catalog = options.catalog.clone();
+        config_options.execution = options.execution.clone();
+        config_options.optimizer = options.optimizer.clone();
+        config_options.sql_parser = options.sql_parser.clone();
+        config_options.explain = options.explain.clone();
+        config_options.extensions = options.extensions.clone();
+        config_options.format = options.format.clone();
+
         let ctx = SessionContext::new_with_config(config);
 
         ctx.register_batch("arguments", args_batch)?;
